@@ -53,7 +53,9 @@ def _compute_reprs(df: pd.DataFrame, n_jobs: int, pool):
     extract only the fields they need and should `del` these lists promptly
     once done (they're large: one object per row)."""
     name_reprs = parallel_map(tr.build_name_repr, df["business_name"].tolist(), pool=pool, n_jobs=n_jobs)
-    addr_reprs = parallel_map(tr.build_address_repr, df["business_address"].tolist(), pool=pool, n_jobs=n_jobs)
+    addr_reprs = parallel_map(tr.build_address_repr_pair,
+                              list(zip(df["business_address"].tolist(), df["country"].astype(str).tolist())),
+                              pool=pool, n_jobs=n_jobs)
     return name_reprs, addr_reprs
 
 
@@ -81,7 +83,7 @@ def add_blocking_representations(
     name_skeleton = [r.skeleton for r in name_reprs]
     addr_norm = [r.normalized for r in addr_reprs]
     addr_leading_digits = [r.leading_digits for r in addr_reprs]
-    addr_first_token = [r.tokens[0] if r.tokens else "" for r in addr_reprs]
+    addr_first_token = [r.first_word for r in addr_reprs]
     del name_reprs, addr_reprs  # free promptly -- see _compute_reprs docstring
 
     name_norm_s = pd.Series(name_norm, index=df.index)
@@ -137,8 +139,9 @@ def add_representations(
 
     df["addr_norm"] = [r.normalized for r in addr_reprs]
     df["addr_leading_digits"] = [r.leading_digits for r in addr_reprs]
-    df["addr_first_token"] = [r.tokens[0] if r.tokens else "" for r in addr_reprs]
+    df["addr_first_token"] = [r.first_word for r in addr_reprs]
     df["addr_digit_tokens"] = [tuple(r.digit_tokens) for r in addr_reprs]
+    df["addr_postcodes"] = [r.postcodes for r in addr_reprs]
     del name_reprs, addr_reprs  # free promptly -- see _compute_reprs docstring
 
     # Composite blocking keys -- combine skeleton (transliteration-tolerant)

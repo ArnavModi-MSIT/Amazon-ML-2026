@@ -33,6 +33,7 @@ DEFAULT_PARAMS = {
     "max_depth": 6,
     "learning_rate": 0.05,
     "subsample": 0.8,
+    "bagging_freq": 1,  # without it LightGBM ignores subsample
     "colsample_bytree": 0.8,
     "min_child_samples": 20,
     "random_state": config.RANDOM_SEED,
@@ -53,8 +54,7 @@ def train(
 
     merged_params = {**DEFAULT_PARAMS, **(params or {})}
     train_set = lgb.Dataset(X, label=y, feature_name=list(X.columns))
-    valid_sets = [train_set]
-    valid_names = ["train"]
+    valid_sets, valid_names = [], []  # no train-set logloss every round (time only)
     callbacks = [lgb.log_evaluation(period=0)]
     if X_val is not None and y_val is not None:
         val_set = lgb.Dataset(X_val, label=y_val, reference=train_set, feature_name=list(X.columns))
@@ -65,8 +65,8 @@ def train(
         merged_params,
         train_set,
         num_boost_round=num_boost_round,
-        valid_sets=valid_sets,
-        valid_names=valid_names,
+        valid_sets=valid_sets or None,
+        valid_names=valid_names or None,
         callbacks=callbacks,
     )
     return booster

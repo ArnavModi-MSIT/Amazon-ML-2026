@@ -10,7 +10,7 @@ FULL train S2/S3 pools, with the same candidate policy used at inference.
 Writes artifacts/model_<tag>.txt, artifacts/thresholds_<tag>.json and
 reports/val_<tag>.parquet (scored validation candidates).
 
-Run: python -u -m src.train_v2 --tag v3
+Run: python -u -m src.train_v2 --tag v4
 """
 import argparse
 import json
@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from . import config, evaluate, io_utils, model, pipeline_v2, postprocess, progress
+from . import text_repr
 from .parallel_utils import DEFAULT_N_JOBS, parallel_pool
 
 N_TRAIN, N_ES, N_VAL = 54_000, 6_000, 20_000
@@ -38,12 +39,21 @@ def _f05(scores: pd.DataFrame, truth: dict, ids: list, tau: float):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", default="v3")
+    ap.add_argument("--tag", default="v4")
     ap.add_argument("--rel-floor", type=float, default=0.5, help="none = no pruning")
     ap.add_argument("--min-rank", type=int, default=3)
+    ap.add_argument("--country-floor", default=None, help='JSON {country: rel_floor} overriding --rel-floor')
     ap.add_argument("--no-prune", action="store_true")
+    ap.add_argument("--n-train", type=int, default=N_TRAIN, help="fit entities (54k while iterating)")
+    ap.add_argument("--segment", action="store_true", help="segment glued pool names in blocking")
+    ap.add_argument("--field-weights", default=None,
+                    help='JSON {country: [w_name, w_addr, empty_addr_c]}: separate name/address '
+                         'normalization in blocking for those countries (default: one joint cosine)')
     args = ap.parse_args()
     rel_floor = None if args.no_prune else args.rel_floor
+    if rel_floor is not None and args.country_floor:
+        rel_floor = {"default": rel_floor, **json.loads(args.country_floor)}
+    field_weights = {c: tuple(w) for c, w in json.loads(args.field_weights).items()} if args.field_weights else None
 
     rng = np.random.default_rng(config.RANDOM_SEED)
     progress.log("Loading train data...")
@@ -60,15 +70,18 @@ def main() -> None:
     val_ids = list(val["entity_id"])
     tune_ids = set(np.random.default_rng(99).permutation(np.array(val_ids))[: N_VAL // 2])
     remaining = s1_all[~s1_all["entity_id"].isin(set(val_ids))]
-    tr = remaining.iloc[np.random.default_rng(7).choice(len(remaining), size=N_TRAIN + N_ES, replace=False)]
-    fit_ids = set(tr["entity_id"].iloc[:N_TRAIN])
-    es_ids = set(tr["entity_id"].iloc[N_TRAIN:])
+    tr = remaining.iloc[np.random.default_rng(7).choice(len(remaining), size=args.n_train + N_ES, replace=False)]
+    fit_ids = set(tr["entity_id"].iloc[:args.n_train])
+    es_ids = set(tr["entity_id"].iloc[args.n_train:])
     s1 = pd.concat([tr, val], ignore_index=True)
-    del s1_all, rest, remaining
+    del rest, remaining  # s1_all stays: S1-frequency features are counted over the whole S1 file
 
     with parallel_pool(DEFAULT_N_JOBS) as pool:
-        cands = pipeline_v2.generate_candidates(s1, s2, s3, k=K, max_df=MAX_DF, pool=pool)
-        cands = pipeline_v2.prune_candidates(cands, rel_floor, args.min_rank)
+        cands = pipeline_v2.generate_candidates(s1, s2, s3, k=K, max_df=MAX_DF, pool=pool, s1_universe=s1_all,
+                                                field_weights=field_weights, segment=args.segment)
+        del s1_all
+        cands = pipeline_v2.prune_candidates(cands, rel_floor, args.min_rank,
+                                             country_of=pd.Series(s1["country"].to_numpy(), index=s1["entity_id"]))
         cands["label"] = [
             int(b in all_true.get(a, ())) for a, b in zip(cands["source1_entity_id"], cands["candidate_entity_id"])
         ]
@@ -78,7 +91,7 @@ def main() -> None:
             progress.log(f"[{nm}] recall ceiling {cands.loc[sub, 'label'].sum() / n_true:.4f}, "
                          f"{sub.sum() / len(ids):.2f} candidates/entity")
         progress.log("featurizing...")
-        X = pipeline_v2.featurize(cands, s1, s2, s3, pool=pool)[pipeline_v2.FEATURE_NAMES_V3]
+        X = pipeline_v2.featurize(cands, s1, s2, s3, pool=pool)[pipeline_v2.FEATURE_NAMES_ALL]
 
     y = cands["label"].to_numpy()
     is_fit = cands["source1_entity_id"].isin(fit_ids).to_numpy()
@@ -86,7 +99,7 @@ def main() -> None:
     is_val = cands["source1_entity_id"].isin(set(val_ids)).to_numpy()
     progress.log(f"train rows {is_fit.sum()} (pos {y[is_fit].sum()}), es rows {is_es.sum()}, val rows {is_val.sum()}")
 
-    booster = model.train(X[is_fit], y[is_fit], X[is_es], y[is_es], num_boost_round=2000, early_stopping_rounds=50)
+    booster = model.train(X[is_fit], y[is_fit], X[is_es], y[is_es], num_boost_round=5000, early_stopping_rounds=50)
     progress.log(f"trained, best_iteration={booster.best_iteration}")
     progress.log("top features:\n" + model.feature_importance(booster).head(15).to_string())
 
@@ -109,7 +122,8 @@ def main() -> None:
     model.save_model(booster, config.MODEL_PATH.parent / f"model_{args.tag}.txt")
     with open(config.THRESHOLDS_PATH.parent / f"thresholds_{args.tag}.json", "w") as f:
         json.dump({"tau0": 0.0, "tau": float(best_tau), "tau_fallback": float(best_tau), "k": K, "max_df": MAX_DF,
-                   "rel_floor": rel_floor, "min_rank": args.min_rank}, f, indent=2)
+                   "rel_floor": rel_floor, "min_rank": args.min_rank, "repr_version": text_repr.REPR_VERSION,
+                   "field_weights": field_weights, "segment": args.segment}, f, indent=2)
     vs.to_parquet(config.PROJECT_ROOT / "code" / "business_entity_resolution" / "reports" / f"val_{args.tag}.parquet",
                   index=False)
     progress.log(f"saved model_{args.tag}.txt, thresholds_{args.tag}.json, val_{args.tag}.parquet")

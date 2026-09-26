@@ -38,3 +38,25 @@ b = tr.normalize_unicode("Shiva Bakery")
 c = tr.normalize_unicode("रियल एग्रो")
 print("Latin vs Latin match:", tr.script_match(a, b), "(expect True)")
 print("Latin vs Devanagari match:", tr.script_match(a, c), "(expect False)")
+
+print()
+print("=== v4 normalization / phonetic checks (asserted) ===")
+CHECKS = [
+    (tr.build_name_repr("Çlub FRÀNCE Mùsique").normalized, "club france musique"),
+    (tr.build_name_repr("M0dern 5tudio Hatt0n").normalized, "modern studio hatton"),
+    (tr.build_name_repr("21st Century 3M").normalized, "21st century 3m"),
+    (tr.build_name_repr("visioncarelynn.com").normalized, "visioncarelynn"),
+    (tr.build_name_repr("NULL").normalized, ""),
+    (tr.build_address_repr("0023 PIERSIDE DR, Maryland").normalized, "23 pierside drive md"),
+    (tr.build_address_repr("Chennai, Tamil Nadu").normalized, tr.build_address_repr("CHENNAI, தமிழ்நாடு").normalized),
+    (tr.build_address_repr("N/A, <NULL>").normalized, ""),
+    (tr.build_address_repr("12 Floor, Main Ct, Florida").normalized, "12 fl main ct fl"),
+    (tr.phonetic_tokens(tr.build_name_repr("விஷன் லக்ஷ்மி ஃபுட்ஸ்").skeleton),
+     tr.phonetic_tokens("vision laxmi foods")),
+    (tr.phonetic_tokens(tr.build_name_repr("क्रिएटिव टेक्नोलॉजी प्राइवेट").skeleton),
+     tr.phonetic_tokens("creative technology private")),
+    (tr.build_name_repr("ಕನ್\u200cಸ್ಟ್ರಕ್ಷನ್").skeleton, "knstrkshn"),
+]
+for i, (got, want) in enumerate(CHECKS):
+    assert got == want, f"check {i}: {got!r} != {want!r}"
+print(f"all {len(CHECKS)} checks passed")

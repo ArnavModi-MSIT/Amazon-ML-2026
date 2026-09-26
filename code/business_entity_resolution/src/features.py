@@ -18,13 +18,18 @@ Reconciled per the plan from four external reviews:
     address (some source records bury the business name in the address field)
   - country-match as an explicit strong feature, not left for the model to
     discover from a single categorical column
+  - v4: phonetic-code Jaccard (typo/transliteration tolerant) and ratios on
+    the space-joined name ("visioncarelynn" vs "vision care of lynn")
 """
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any
 
+import numpy as np
+
 from rapidfuzz import fuzz
-from rapidfuzz.distance import JaroWinkler, LCSseq
+from rapidfuzz.distance import JaroWinkler, LCSseq, Levenshtein
 
 from . import text_repr as tr
 
@@ -74,6 +79,18 @@ def _script_fractions(normalized: str) -> dict[str, float]:
     return {"pct_latin": latin / total, "pct_digit": digit / total, "pct_non_latin": non_latin / total}
 
 
+@lru_cache(maxsize=50_000)
+def _phonetic_set(skeleton: str) -> frozenset:
+    return frozenset(tr.phonetic_tokens(skeleton))
+
+
+_JOIN_DROP = {"and", "the", "of"}
+
+
+def _joined(tokens) -> str:
+    return "".join(t for t in tokens if t not in _JOIN_DROP)
+
+
 def build_name_features(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float]:
     """`a`/`b` are row dicts with the representation columns from
     `blocking.add_representations` (name_norm, name_skeleton, name_tokens_no_suffix, ...).
@@ -100,8 +117,13 @@ def build_name_features(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float
         "name_len_ratio": _len_ratio(a_norm, b_norm),
         "name_token_count_diff": float(abs(len(a["name_tokens_no_suffix"]) - len(b["name_tokens_no_suffix"]))),
         "name_suffix_match": float(bool(set(a.get("name_suffix_tokens", [])) & set(b.get("name_suffix_tokens", [])))),
+        "name_suffix_family_match": float(bool(
+            {tr.SUFFIX_FAMILY.get(t, t) for t in a.get("name_suffix_tokens", [])}
+            & {tr.SUFFIX_FAMILY.get(t, t) for t in b.get("name_suffix_tokens", [])})),
         "name_suffix_present_both": float(bool(a.get("name_suffix_tokens")) and bool(b.get("name_suffix_tokens"))),
         "script_match": float(a["dominant_script"] == b["dominant_script"] and a["dominant_script"] != "None"),
+        # empty names make every similarity below 1.0 ("perfect"); this flag lets the model discount them
+        "name_missing_either": float(not a_norm or not b_norm),
         # Explicit exact-key-match flags -- the fuzzy string-similarity
         # features above are already ~1.0 for these cases, but an explicit
         # boolean gives the tree model a clean, single-feature split instead
@@ -116,6 +138,14 @@ def build_name_features(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float
             and a["name_tokens_no_suffix"][0] == b["name_tokens_no_suffix"][0]
         ),
     }
+    # typo/transliteration-tolerant: consonant-class codes of the skeleton words
+    feats["name_phonetic_jaccard"] = _jaccard(_phonetic_set(a_skel), _phonetic_set(b_skel))
+    # spacing-tolerant: "visioncarelynn" vs "vision care of lynn"
+    a_join, b_join = _joined(a["name_tokens_no_suffix"]), _joined(b["name_tokens_no_suffix"])
+    feats["name_joined_ratio"] = _safe_ratio(fuzz.ratio, a_join, b_join) / 100.0
+    feats["name_joined_partial_ratio"] = _safe_ratio(fuzz.partial_ratio, a_join, b_join) / 100.0
+    a_core, b_core = tr.name_core(a_norm), tr.name_core(b_norm)
+    feats["name_core_match"] = float(bool(a_core) and a_core == b_core)
     a_script_pct = _script_fractions(a_norm)
     b_script_pct = _script_fractions(b_norm)
     feats["pct_non_latin_diff"] = abs(a_script_pct["pct_non_latin"] - b_script_pct["pct_non_latin"])
@@ -130,12 +160,22 @@ def build_address_features(a: dict[str, Any], b: dict[str, Any]) -> dict[str, fl
     a_digits, b_digits = set(a["addr_digit_tokens"]), set(b["addr_digit_tokens"])
     # 5-digit (US zip / French postal code) or 6-digit (India PIN) tokens --
     # separates "same postcode" from a coincidentally shared street number.
-    a_codes = {t for t in a_digits if len(t) in (5, 6)}
-    b_codes = {t for t in b_digits if len(t) in (5, 6)}
+    a_codes, b_codes = set(a.get("addr_postcodes", ())), set(b.get("addr_postcodes", ()))  # zeros kept
     postcode = -1.0 if not (a_codes and b_codes) else float(bool(a_codes & b_codes))
+    # house number wherever it sits (fields are often reordered), and the street word after it
+    a_num, a_street = tr.address_number_key(a_norm)
+    b_num, b_street = tr.address_number_key(b_norm)
+    has_nums = bool(a_num) and bool(b_num)
 
     return {
         "addr_postcode_match": postcode,
+        "addr_num_match": float(a_num == b_num) if has_nums else -1.0,
+        # 6221 vs 6225 (edit 1, diff 4, same length: neighbour) vs 13800 vs 3800 (edit 1, dropped digit)
+        "addr_num_edit": float(min(Levenshtein.distance(a_num, b_num), 4)) if has_nums else -1.0,
+        "addr_num_log_absdiff": float(np.log1p(abs(int(a_num) - int(b_num)))) if has_nums else -1.0,
+        "addr_num_len_diff": float(abs(len(a_num) - len(b_num))) if has_nums else -1.0,
+        "addr_num_street_match": (float(a_num == b_num and a_street == b_street)
+                                  if has_nums and a_street and b_street else -1.0),
         "addr_char_ngram_jaccard": _jaccard(a_ngrams, b_ngrams),
         "addr_token_jaccard": _jaccard(a_tokens, b_tokens),
         "addr_levenshtein_ratio": _safe_ratio(fuzz.ratio, a_norm, b_norm) / 100.0,
@@ -144,7 +184,8 @@ def build_address_features(a: dict[str, Any], b: dict[str, Any]) -> dict[str, fl
         "addr_leading_digits_match": float(
             bool(a["addr_leading_digits"]) and a["addr_leading_digits"] == b["addr_leading_digits"]
         ),
-        "addr_digit_token_jaccard": _jaccard(a_digits, b_digits),
+        # -1 = no evidence (a side has no digits), not "perfect agreement"
+        "addr_digit_token_jaccard": _jaccard(a_digits, b_digits) if a_digits and b_digits else -1.0,
         "addr_missing_either": float(a_missing or b_missing),
         "addr_missing_both": float(a_missing and b_missing),
         "addr_key_exact_match": float(bool(a.get("addr_key")) and a.get("addr_key") == b.get("addr_key")),
