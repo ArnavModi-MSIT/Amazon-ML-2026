@@ -1,0 +1,7 @@
+# competition data is not redistributed
+dataset/
+*.tsv
+output/
+reports/
+__pycache__/
+*.pyc

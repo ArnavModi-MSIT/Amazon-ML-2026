@@ -1,0 +1,9 @@
+{
+  "tau0": 0.0,
+  "tau": 0.65,
+  "tau_fallback": 0.65,
+  "k": 10,
+  "max_df": 50000,
+  "rel_floor": 0.5,
+  "min_rank": 3
+}
