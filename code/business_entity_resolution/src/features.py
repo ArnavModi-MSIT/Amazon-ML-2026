@@ -132,6 +132,17 @@ def build_name_features(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float
         # candidate this strong shouldn't rely purely on the classifier
         # rediscovering it from continuous similarity scores).
         "name_key_exact_match": float(bool(a.get("name_key")) and a.get("name_key") == b.get("name_key")),
+        # (teammate idea) first letter of the first no-suffix token survives small typos ("acme"/"akme"),
+        # token-sorted ratio on the skeleton catches reordered transliterated names
+        "name_initial_match": float(
+            bool(a["name_tokens_no_suffix"]) and bool(b["name_tokens_no_suffix"])
+            and a["name_tokens_no_suffix"][0][:1] == b["name_tokens_no_suffix"][0][:1]
+        ),
+        "name_skeleton_token_sort_ratio": _safe_ratio(fuzz.token_sort_ratio, a_skel, b_skel) / 100.0,
+        "name_last_token_match": float(
+            bool(a["name_tokens_no_suffix"]) and bool(b["name_tokens_no_suffix"])
+            and a["name_tokens_no_suffix"][-1] == b["name_tokens_no_suffix"][-1]
+        ),
         # First distinctive token is often the brand ("acme" in "acme robotics inc").
         "name_first_token_match": float(
             bool(a["name_tokens_no_suffix"]) and bool(b["name_tokens_no_suffix"])
@@ -177,6 +188,10 @@ def build_address_features(a: dict[str, Any], b: dict[str, Any]) -> dict[str, fl
         "addr_num_street_match": (float(a_num == b_num and a_street == b_street)
                                   if has_nums and a_street and b_street else -1.0),
         "addr_char_ngram_jaccard": _jaccard(a_ngrams, b_ngrams),
+        # address words only (numbers stripped): same street/area even when the number is corrupted
+        "addr_words_token_set_ratio": _safe_ratio(
+            fuzz.token_set_ratio, " ".join(t for t in a_norm.split() if not t.isdigit()),
+            " ".join(t for t in b_norm.split() if not t.isdigit())) / 100.0,
         "addr_token_jaccard": _jaccard(a_tokens, b_tokens),
         "addr_levenshtein_ratio": _safe_ratio(fuzz.ratio, a_norm, b_norm) / 100.0,
         "addr_token_sort_ratio": _safe_ratio(fuzz.token_sort_ratio, a_norm, b_norm) / 100.0,

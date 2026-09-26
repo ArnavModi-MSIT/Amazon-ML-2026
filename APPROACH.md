@@ -11,7 +11,10 @@ _Status as of 26 Sep 2026, 09:15 IST. Submission deadline: 27 Sep 2026, 11:59 PM
 | v3 | + relative-floor pruning, pool-frequency + within-entity features | 0.9399 | **0.927** (#04) |
 | v4 | + normalization fixes, 9-script transliteration, phonetic blocking tokens, 3 features | 0.9563 | not submitted |
 | v5 | + glued-name segmentation, India field-weighted blocking, S1-population / house-number / address-frequency features, count clipping | 0.9701 | not submitted |
-| **v6** | + review bug fixes, India pruning floor 0.55, 150k training entities | **0.9712** | **0.962** (#05) |
+| v6 | + review bug fixes, India pruning floor 0.55, 150k training entities | 0.9712 | 0.962 (#05) |
+| v7 | + native words dropped from blocking, 2 teammate features (3-seed ensemble tested: worse) | 0.9718 | not submitted |
+| v8 | + learned transliteration dictionary, name/address cleanup, exact-key channel, 3 features (ideas from public repos) | 0.9768 | 0.968 (#06) |
+| **v9** | + reverse top-1 channel (each pool record's best S1 among the whole S1 file) as candidates + 3 features | **0.9803** | **0.971** (#07) |
 
 Sections 3–4 describe v2 as originally reviewed; the v3–v6 changes are summarised in §3.7 and §3.8.
 

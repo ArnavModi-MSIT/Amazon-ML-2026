@@ -35,6 +35,7 @@ by `build_name_repr`/`build_address_repr`), not part of the graded pipeline.
 """
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -48,8 +49,11 @@ import regex  # third-party: needed for \p{Script=...}, stdlib `re` doesn't supp
 # but feature semantics changed (digit Jaccard -1 when a side has no digits),
 # so v4 models must not run on this code. v6: addr_key uses the street token
 # (was "18|18"), postcodes keep leading zeros, unit numbers never taken as the
-# house number.
-REPR_VERSION = "v6"
+# house number. v8: learned translit dictionary in the skeleton, record ids /
+# honorifics / alias markers removed from names, name abbreviation canon,
+# address city-typo / ordinal / digit-letter cleanup, more cities and
+# French departements.
+REPR_VERSION = "v8"
 
 # ---------------------------------------------------------------------------
 # Legal suffix normalization -- conservative, not English-only (reviewer #1/#4
@@ -124,9 +128,22 @@ def normalize_unicode(s: str) -> str:
 # Placeholder values some sources use for a missing field.
 _NULL_TOKENS = {"null", "none", "nan", "nil"}
 
+# Name noise the sources append/prepend: record ids ("#22441", "(ID: 70983)"), "M/s", alias markers.
+_NAME_NOISE_RE = re.compile(r"\(\s*id[:\s]*\d+\s*\)|\bid:\s*\d+|#\s*\d+|\bm\s*/\s*s\b|\b[daf]\s*/\s*[bk]\s*/\s*a\b")
+_HONORIFICS = {"smt", "shri", "sri", "shree", "mr", "mrs", "ms", "dr", "dba", "aka", "fka"}
+# Abbreviation / spelling variants of the same name word (both sides map to one form).
+_NAME_CANON = {
+    "intl": "international", "bros": "brothers", "bro": "brothers", "svcs": "services", "svc": "services",
+    "srvcs": "services", "service": "services", "mfg": "manufacturing", "mgmt": "management",
+    "tech": "technologies", "techs": "technologies", "technology": "technologies", "assoc": "associates",
+    "assocs": "associates", "grp": "group", "natl": "national", "univ": "university", "hosp": "hospital",
+    "ctr": "center", "centre": "center", "cntr": "center", "dept": "department", "soc": "society",
+    "lndia": "india", "ndia": "india", "lnc": "inc", "sys": "systems", "syst": "systems", "inds": "industries",
+}
+
 # Digits used as look-alike letters inside names ("M0dern", "5tudio", "Hatt0n").
 _LEET = str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b"})
-_NAME_DROP_TOKENS = {"www", "com", "http", "https"} | _NULL_TOKENS
+_NAME_DROP_TOKENS = {"www", "com", "http", "https"} | _NULL_TOKENS | _HONORIFICS
 
 
 def _fix_name_token(t: str) -> str:
@@ -140,7 +157,33 @@ def _fix_name_token(t: str) -> str:
 
 
 def clean_name_tokens(normalized: str) -> list[str]:
-    return [_fix_name_token(t) for t in normalized.split() if t not in _NAME_DROP_TOKENS]
+    out = []
+    for t in normalized.split():
+        if t in _NAME_DROP_TOKENS:
+            continue
+        t = _fix_name_token(t)
+        out.append(_NAME_CANON.get(t, t))
+    return out
+
+
+def clean_name_raw(raw: str) -> str:
+    return _NAME_NOISE_RE.sub(" ", raw.casefold()) if raw else ""
+
+
+# Learned native-script word -> S1 English word map (src/translit_dict.py), loaded in every process from the
+# path in BER_TRANSLIT so training and inference use the identical dictionary.
+_TRANSLIT: dict[str, str] = {}
+
+
+def load_translit(path: str) -> None:
+    import json
+    _TRANSLIT.clear()
+    with open(path, encoding="utf-8") as f:
+        _TRANSLIT.update(json.load(f))
+
+
+if os.environ.get("BER_TRANSLIT"):
+    load_translit(os.environ["BER_TRANSLIT"])
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +218,16 @@ _ADDR_SINGLE = {
     "odisha": "od", "orissa": "od", "ଓଡ଼ିଶା": "od",
     # renamed cities
     "bengaluru": "bangalore", "gurugram": "gurgaon", "bombay": "mumbai", "calcutta": "kolkata",
-    "madras": "chennai", "ahmadabad": "ahmedabad",
+    "madras": "chennai", "ahmadabad": "ahmedabad", "poona": "pune", "mysuru": "mysore",
+    "trivandrum": "thiruvananthapuram", "vizag": "visakhapatnam", "baroda": "vadodara", "cochin": "kochi",
+    "shivamogga": "shimoga", "hubballi": "hubli", "belagavi": "belgaum",
+    # "city" typos the sources inject ("Jamaica Ccity", "ELK GROVE CIITY")
+    "ccity": "city", "ciity": "city", "citty": "city", "ciy": "city", "ciyt": "city", "icty": "city",
+    "ctiy": "city", "cty": "city",
+    # ordinal words ("tenth street" == "10th street" -> "10")
+    **{w: str(i + 1) for i, w in enumerate(
+        "first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth thirteenth "
+        "fourteenth fifteenth sixteenth seventeenth eighteenth nineteenth twentieth".split())},
 }
 _ADDR_MULTI = {
     ("new", "hampshire"): "nh", ("new", "jersey"): "nj", ("new", "mexico"): "nm", ("new", "york"): "ny",
@@ -194,6 +246,9 @@ _ADDR_COUNTRY = {
     "France": {
         "st": "saint", "ste": "sainte", "r": "rue", "all": "allee", "ch": "chemin", "crs": "cours", "q": "quai",
         "no": "", "n": "", "nord": "reg_hdf", "gironde": "reg_naq",  # "N°"/"nº" -> n / no
+        "somme": "reg_hdf", "oise": "reg_hdf", "aisne": "reg_hdf", "landes": "reg_naq",
+        "vendee": "reg_pdl", "sarthe": "reg_pdl", "mayenne": "reg_pdl", "qu": "quai", "res": "residence",
+        "fg": "faubourg", "bld": "boulevard"
     },
 }
 _ADDR_MULTI_COUNTRY = {
@@ -201,6 +256,8 @@ _ADDR_MULTI_COUNTRY = {
         ("hauts", "de", "france"): "reg_hdf", ("pas", "de", "calais"): "reg_hdf",
         ("nouvelle", "aquitaine"): "reg_naq",
         ("pays", "de", "la", "loire"): "reg_pdl", ("loire", "atlantique"): "reg_pdl",
+        ("maine", "et", "loire"): "reg_pdl", ("charente", "maritime"): "reg_naq",
+        ("pyrenees", "atlantiques"): "reg_naq",
     },
 }
 _ADDR_TABLES = {
@@ -210,8 +267,23 @@ _ADDR_TABLES = {
 _ADDR_MULTI_MAX = max(len(k) for tbl in [_ADDR_MULTI, *_ADDR_MULTI_COUNTRY.values()] for k in tbl)
 
 
+_ORDINAL_NUM_RE = re.compile(r"(\d+)(?:st|nd|rd|th)")
+_DIGIT_ALPHA_RE = re.compile(r"(?<=\d)(?=[^\W\d_])|(?<=[^\W\d_])(?=\d)")
+
+
+def _split_address_token(t: str) -> list[str]:
+    """"10th" -> "10", "12st" (typo) -> "12", "13815c" -> "13815 c", "flr10" -> "flr 10"."""
+    if t.isdigit() or t.isalpha() or not t.isascii():
+        return [t]
+    m = _ORDINAL_NUM_RE.fullmatch(t)
+    if m:
+        return [m.group(1)]
+    return _DIGIT_ALPHA_RE.sub(" ", t).split()
+
+
 def canonicalize_address_tokens(tokens: list[str], country: str = "") -> list[str]:
     single, multi = _ADDR_TABLES.get(country, (_ADDR_SINGLE, _ADDR_MULTI))
+    tokens = [p for t in tokens for p in _split_address_token(t)]
     out: list[str] = []
     i = 0
     while i < len(tokens):
@@ -588,7 +660,7 @@ def build_name_repr(raw: str) -> NameRepr:
     ~11.7M raw train+test records was pure wasted memory. Removing it is what
     fixed a real MemoryError crash during a full-scale run -- caught by
     actually running at scale, not by inspection."""
-    tokens = clean_name_tokens(normalize_unicode(raw))
+    tokens = clean_name_tokens(normalize_unicode(clean_name_raw(raw)))
     normalized = " ".join(tokens)
     tokens_no_suffix, suffix_tokens = strip_legal_suffixes(tokens)
     return NameRepr(
@@ -598,7 +670,8 @@ def build_name_repr(raw: str) -> NameRepr:
         suffix_tokens=suffix_tokens,
         tokens_no_suffix=tokens_no_suffix,
         dominant_script=dominant_script(normalized),
-        skeleton=transliterate_skeleton(normalized),
+        skeleton=(" ".join(_TRANSLIT.get(t) or transliterate_skeleton(t) for t in tokens) if _TRANSLIT
+                  else transliterate_skeleton(normalized)),
     )
 
 

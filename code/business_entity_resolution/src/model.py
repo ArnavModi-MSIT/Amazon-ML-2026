@@ -88,6 +88,40 @@ def load_model(path: str | Path) -> "lgb.Booster":
     return lgb.Booster(model_file=str(path))
 
 
+# Seed-bagged ensemble (idea from a teammate's branch): members train on the same rows and differ only in
+# random_state, i.e. in every bagging / feature-subsample draw; averaging their probabilities smooths
+# split-point noise. n_members=1 is the plain single model.
+DEFAULT_ENSEMBLE_SEEDS = (config.RANDOM_SEED, 2024, 7)
+
+
+def train_ensemble(X, y, X_val=None, y_val=None, params: dict | None = None, num_boost_round: int = 5000,
+                   early_stopping_rounds: int = 50, n_members: int = 3,
+                   seeds: tuple = DEFAULT_ENSEMBLE_SEEDS) -> list:
+    seeds = (list(seeds) * n_members)[:max(1, n_members)]
+    return [train(X, y, X_val, y_val, {**(params or {}), "random_state": int(s)},
+                  num_boost_round=num_boost_round, early_stopping_rounds=early_stopping_rounds) for s in seeds]
+
+
+def predict_proba_ensemble(models: list, X: pd.DataFrame) -> np.ndarray:
+    """Mean probability over members."""
+    return np.mean([predict_proba(b, X) for b in models], axis=0)
+
+
+def save_models(models: list, path_stem: str | Path) -> None:
+    """One member: <stem>.txt (the single-model layout); several: <stem>_0.txt, <stem>_1.txt, ..."""
+    if len(models) == 1:
+        save_model(models[0], f"{path_stem}.txt")
+    else:
+        for i, b in enumerate(models):
+            save_model(b, f"{path_stem}_{i}.txt")
+
+
+def load_models(path_stem: str | Path, n_members: int = 1) -> list:
+    if n_members <= 1:
+        return [load_model(f"{path_stem}.txt")]
+    return [load_model(f"{path_stem}_{i}.txt") for i in range(n_members)]
+
+
 def feature_importance(booster: "lgb.Booster") -> pd.Series:
     imp = pd.Series(
         booster.feature_importance(importance_type="gain"), index=booster.feature_name()

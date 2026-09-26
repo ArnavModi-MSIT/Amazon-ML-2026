@@ -36,7 +36,8 @@ DEFAULT_MAX_DF = 50_000
 MATMUL_BATCH = 100_000
 
 
-def record_tokens(name_norm: str, name_skeleton: str, addr_norm: str, phonetic: bool, name_seg: str = "") -> list[str]:
+def record_tokens(name_norm: str, name_skeleton: str, addr_norm: str, phonetic: bool, name_seg: str = "",
+                  latin_only: bool = False) -> list[str]:
     """Bag of field-prefixed tokens:
       n: name words (normalized + transliteration skeleton), a: address words
          (any digit run counts -- single-digit house numbers are specific),
@@ -52,9 +53,12 @@ def record_tokens(name_norm: str, name_skeleton: str, addr_norm: str, phonetic: 
     whose name is noisy -- so name joining is only a model feature.
     `name_seg`: S1-vocabulary segmentation of a glued pool name
     ("calkinxflh" -> "calkin xflh"), added as ordinary n: words."""
-    toks = {"n:" + t for t in name_norm.split() if len(t) >= 2}
-    toks |= {"n:" + t for t in name_skeleton.split() if len(t) >= 2}
-    toks |= {"a:" + t for t in addr_norm.split() if len(t) >= 2 or t.isdigit()}
+    # latin_only: drop non-ASCII words. S1 is entirely Latin, so a native-script word in a pool record can
+    # never match a query; it only inflates that record's norm and ranks native-script records lower.
+    live = str.isascii if latin_only else (lambda t: True)
+    toks = {"n:" + t for t in name_norm.split() if len(t) >= 2 and live(t)}
+    toks |= {"n:" + t for t in name_skeleton.split() if len(t) >= 2 and live(t)}
+    toks |= {"a:" + t for t in addr_norm.split() if (len(t) >= 2 or t.isdigit()) and live(t)}
     if phonetic:
         toks |= {"p:" + c for c in tr.phonetic_tokens(name_skeleton)}
     if name_seg:
@@ -172,6 +176,7 @@ def topk_candidates(
     max_df: int = DEFAULT_MAX_DF,
     label: str = "",
     field_weights: tuple[float, ...] | None = None,
+    latin_only_tokens: bool = False,
 ) -> pd.DataFrame:
     """`s1_rep`/`pool_rep` need entity_id, country, name_norm, name_skeleton,
     addr_norm (e.g. from blocking.add_blocking_representations).
@@ -194,13 +199,14 @@ def topk_candidates(
         p = pool_rep[pool_rep["country"] == country]
         vec = TfidfVectorizer(analyzer=_identity, sublinear_tf=True, dtype=np.float32)
         P = vec.fit_transform(
-            [record_tokens(a, b, c, not a.isascii(), d)
+            [record_tokens(a, b, c, not a.isascii(), d, latin_only_tokens)
              for a, b, c, d in zip(p["name_norm"], p["name_skeleton"], p["addr_norm"],
                                    p["name_seg"] if "name_seg" in p else [""] * len(p))]
         ).tocsr()
         keep = np.bincount(P.indices, minlength=P.shape[1]) <= max_df
         Q = vec.transform(
-            [record_tokens(a, b, c, True) for a, b, c in zip(q["name_norm"], q["name_skeleton"], q["addr_norm"])]
+            [record_tokens(a, b, c, True, "", latin_only_tokens)
+             for a, b, c in zip(q["name_norm"], q["name_skeleton"], q["addr_norm"])]
         ).tocsr()
         fw = field_weights.get(country) if isinstance(field_weights, dict) else field_weights
         if fw is None:
@@ -233,4 +239,65 @@ def topk_candidates(
         res.groupby("source1_entity_id")["block_score"].rank(method="first", ascending=False).astype(np.int16) - 1
     )
     res["block_top_score"] = res.groupby("source1_entity_id")["block_score"].transform("max").astype(np.float32)
+    return res
+
+
+def reverse_topk(
+    s1_rep: pd.DataFrame,
+    pool_rep: pd.DataFrame,
+    k: int = 2,
+    max_df: int = DEFAULT_MAX_DF,
+    label: str = "",
+    field_weights=None,
+    latin_only_tokens: bool = False,
+) -> pd.DataFrame:
+    """Reverse direction of `topk_candidates`: for every POOL record, its top-k S1 records under the same
+    cosine (same vectorizer fit on the pool, same token policy and normalization). Each pool record belongs
+    to at most one S1 entity, so the S1 entity it scores highest is a natural candidate even when that
+    entity's own forward top-K is crowded by look-alikes. `s1_rep` must be the WHOLE S1 file of the split,
+    so an entity competes with every other S1 record. Idea from a public competition repo (reverse pass).
+    Returns source1_entity_id, candidate_entity_id, rev_score, rev_rank (0 = the pool record's best S1)."""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sparse_dot_topn import sp_matmul_topn
+
+    out = []
+    for country in sorted(set(s1_rep["country"]) & set(pool_rep["country"])):
+        q = s1_rep[s1_rep["country"] == country]
+        p = pool_rep[pool_rep["country"] == country]
+        vec = TfidfVectorizer(analyzer=_identity, sublinear_tf=True, dtype=np.float32)
+        P = vec.fit_transform(
+            [record_tokens(a, b, c, not a.isascii(), d, latin_only_tokens)
+             for a, b, c, d in zip(p["name_norm"], p["name_skeleton"], p["addr_norm"],
+                                   p["name_seg"] if "name_seg" in p else [""] * len(p))]
+        ).tocsr()
+        keep = np.bincount(P.indices, minlength=P.shape[1]) <= max_df
+        Q = vec.transform(
+            [record_tokens(a, b, c, True, "", latin_only_tokens)
+             for a, b, c in zip(q["name_norm"], q["name_skeleton"], q["addr_norm"])]
+        ).tocsr()
+        fw = field_weights.get(country) if isinstance(field_weights, dict) else field_weights
+        if fw is None:
+            Pn, Qn = _mask_and_normalize(P, keep), _mask_and_normalize(Q, keep)
+        else:
+            is_addr = np.char.startswith(vec.get_feature_names_out().astype(str), "a:")
+            w_name, w_addr, *c = fw
+            Pn = _field_normalize(P, keep, is_addr, (w_name, w_addr), c[0] if c else None)
+            Qn = _field_normalize(Q, keep, is_addr, (1.0, 1.0))
+        del P, Q
+        QT = Qn.T.tocsr()
+        del Qn
+        q_ids, p_ids = q["entity_id"].to_numpy(), p["entity_id"].to_numpy()
+        progress.log(f"  [rev{label}] {country}: {len(p)} pool x {len(q)} S1")
+        for start in range(0, Pn.shape[0], MATMUL_BATCH):
+            S = sp_matmul_topn(Pn[start:start + MATMUL_BATCH], QT, top_n=k, threshold=0.0, n_threads=-1).tocsr()
+            rows = np.repeat(np.arange(S.shape[0]), np.diff(S.indptr))
+            out.append(pd.DataFrame({
+                "source1_entity_id": q_ids[S.indices],
+                "candidate_entity_id": p_ids[start + rows],
+                "rev_score": S.data.astype(np.float32),
+            }))
+        del Pn, QT
+    res = pd.concat(out, ignore_index=True)
+    res["rev_rank"] = (res.groupby("candidate_entity_id")["rev_score"]
+                       .rank(method="first", ascending=False).astype(np.int16) - 1)
     return res

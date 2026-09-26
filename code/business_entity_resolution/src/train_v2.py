@@ -46,6 +46,11 @@ def main() -> None:
     ap.add_argument("--no-prune", action="store_true")
     ap.add_argument("--n-train", type=int, default=N_TRAIN, help="fit entities (54k while iterating)")
     ap.add_argument("--segment", action="store_true", help="segment glued pool names in blocking")
+    ap.add_argument("--n-ensemble", type=int, default=1, help="seed-bagged LightGBM members (probabilities averaged)")
+    ap.add_argument("--latin-only-tokens", action="store_true", help="drop non-ASCII words from blocking vectors")
+    ap.add_argument("--translit", action="store_true", help="learned native-script word dictionary (translit_dict)")
+    ap.add_argument("--key-channel", action="store_true", help="exact name+number key candidates next to top-K")
+    ap.add_argument("--reverse", action="store_true", help="reverse top-1 channel: each pool record's best S1 entity")
     ap.add_argument("--field-weights", default=None,
                     help='JSON {country: [w_name, w_addr, empty_addr_c]}: separate name/address '
                          'normalization in blocking for those countries (default: one joint cosine)')
@@ -76,9 +81,20 @@ def main() -> None:
     s1 = pd.concat([tr, val], ignore_index=True)
     del rest, remaining  # s1_all stays: S1-frequency features are counted over the whole S1 file
 
+    translit_file = None
+    if args.translit:  # before the pool starts, so worker processes load the same dictionary
+        from . import translit_dict
+        mapping = translit_dict.build(s1_all, [s2, s3], all_true, exclude_s1=set(val_ids))
+        translit_file = f"translit_{args.tag}.json"
+        translit_dict.save(mapping, config.ARTIFACTS_DIR / translit_file)
+        translit_dict.activate(config.ARTIFACTS_DIR / translit_file)
+        progress.log(f"translit dictionary: {len(mapping)} words (validation entities excluded)")
+
     with parallel_pool(DEFAULT_N_JOBS) as pool:
         cands = pipeline_v2.generate_candidates(s1, s2, s3, k=K, max_df=MAX_DF, pool=pool, s1_universe=s1_all,
-                                                field_weights=field_weights, segment=args.segment)
+                                                field_weights=field_weights, segment=args.segment,
+                                                latin_only_tokens=args.latin_only_tokens, key_channel=args.key_channel,
+                                                reverse=args.reverse)
         del s1_all
         cands = pipeline_v2.prune_candidates(cands, rel_floor, args.min_rank,
                                              country_of=pd.Series(s1["country"].to_numpy(), index=s1["entity_id"]))
@@ -99,12 +115,16 @@ def main() -> None:
     is_val = cands["source1_entity_id"].isin(set(val_ids)).to_numpy()
     progress.log(f"train rows {is_fit.sum()} (pos {y[is_fit].sum()}), es rows {is_es.sum()}, val rows {is_val.sum()}")
 
-    booster = model.train(X[is_fit], y[is_fit], X[is_es], y[is_es], num_boost_round=5000, early_stopping_rounds=50)
-    progress.log(f"trained, best_iteration={booster.best_iteration}")
+    boosters = model.train_ensemble(X[is_fit], y[is_fit], X[is_es], y[is_es], num_boost_round=5000,
+                                    early_stopping_rounds=50, n_members=args.n_ensemble)
+    booster = boosters[0]
+    progress.log(f"trained {len(boosters)} member(s), best_iteration={[b.best_iteration for b in boosters]}")
     progress.log("top features:\n" + model.feature_importance(booster).head(15).to_string())
 
     vs = cands.loc[is_val].copy()
-    vs["prob"] = model.predict_proba(booster, X[is_val]).astype(np.float32)
+    vs["prob"] = model.predict_proba_ensemble(boosters, X[is_val]).astype(np.float32)
+    if len(boosters) > 1:  # single-member score on the same rows, to see what the ensemble adds
+        vs["prob_member0"] = model.predict_proba(booster, X[is_val]).astype(np.float32)
     vs["half"] = np.where(vs["source1_entity_id"].isin(tune_ids), "tune", "report")
     truth = {e: all_true.get(e, set()) for e in val_ids}
     t_ids = [e for e in val_ids if e in tune_ids]
@@ -119,11 +139,13 @@ def main() -> None:
         ids_c = [e for e in r_ids if country[e] == cty]
         progress.log(f"[{args.tag}]   {cty}: {_f05(vs[vs['half'] == 'report'], truth, ids_c, best_tau)[0]['macro_f0.5']:.4f}")
 
-    model.save_model(booster, config.MODEL_PATH.parent / f"model_{args.tag}.txt")
+    model.save_models(boosters, config.MODEL_PATH.parent / f"model_{args.tag}")
     with open(config.THRESHOLDS_PATH.parent / f"thresholds_{args.tag}.json", "w") as f:
         json.dump({"tau0": 0.0, "tau": float(best_tau), "tau_fallback": float(best_tau), "k": K, "max_df": MAX_DF,
                    "rel_floor": rel_floor, "min_rank": args.min_rank, "repr_version": text_repr.REPR_VERSION,
-                   "field_weights": field_weights, "segment": args.segment}, f, indent=2)
+                   "field_weights": field_weights, "segment": args.segment,
+                   "n_ensemble": len(boosters), "latin_only_tokens": args.latin_only_tokens,
+                   "translit": translit_file, "key_channel": args.key_channel, "reverse": args.reverse}, f, indent=2)
     vs.to_parquet(config.PROJECT_ROOT / "code" / "business_entity_resolution" / "reports" / f"val_{args.tag}.parquet",
                   index=False)
     progress.log(f"saved model_{args.tag}.txt, thresholds_{args.tag}.json, val_{args.tag}.parquet")
