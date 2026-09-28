@@ -47,7 +47,7 @@ UNIVERSE_FEATURES = ["log_cand_core_s1_freq", "log_cand_core_pool_freq", "log_s1
 POOL_COUNT_CLIP, S1_COUNT_CLIP = 8, 4
 # key_channel: pair found only by the exact-key pass (no cosine score); g_same_*: how many of the entity's
 # other candidates share this candidate's name core / full address (duplicates of one business cluster)
-KEY_FEATURES = ["key_channel", "g_same_name", "g_same_addr"]
+KEY_FEATURES = ["key_channel", "g_same_name", "g_same_addr", "empty_channel"]
 # Reverse pass: each pool record's single best S1 entity among the WHOLE S1 file (same cosine). rev_top1 = this
 # entity is it; rev_other = another S1 entity is it (evidence against); rev_best_ratio = this pair's cosine
 # relative to the record's best. Measured: +0.39 candidates/entity took the blocking recall ceiling 0.965 -> 0.978.
@@ -135,6 +135,40 @@ def _tok_s1_frac(rep: pd.DataFrame, s1_tokens: set) -> pd.Series:
     return pd.Series(np.asarray(out, dtype=np.float32), index=rep["entity_id"].to_numpy())
 
 
+# country -> {"name": {token: idf}, "addr": {token: idf}, "n": pool size}; filled by generate_candidates from the
+# pools of the current split and read by featurize (same process) to attach per-record token weights.
+_IDF: dict[str, dict] = {}
+
+
+def _accumulate_df(rep: pd.DataFrame, df_counts: dict) -> None:
+    for cty, nn, an in zip(rep["country"].astype(str), rep["name_norm"], rep["addr_norm"]):
+        d = df_counts.setdefault(cty, {"name": {}, "addr": {}, "n": 0})
+        d["n"] += 1
+        for t in {t for t in nn.split() if t not in tr.LEGAL_SUFFIXES}:
+            d["name"][t] = d["name"].get(t, 0) + 1
+        for t in set(an.split()):
+            d["addr"][t] = d["addr"].get(t, 0) + 1
+
+
+def _finalize_idf(df_counts: dict) -> None:
+    _IDF.clear()
+    for cty, d in df_counts.items():
+        n = d["n"]
+        _IDF[cty] = {"n": n, **{f: {t: float(np.log(n / c)) for t, c in d[f].items()} for f in ("name", "addr")}}
+
+
+def _attach_idf(lookup: dict, name_field: str) -> None:
+    """Add name_idf / addr_idf {token: idf} to each record dict (unseen tokens get the maximum idf)."""
+    for rec in lookup.values():
+        d = _IDF.get(str(rec.get("country", "")))
+        if d is None:
+            rec["name_idf"], rec["addr_idf"] = {}, {}
+            continue
+        mx = float(np.log(max(d["n"], 2)))
+        rec["name_idf"] = {t: d["name"].get(t, mx) for t in rec[name_field]}
+        rec["addr_idf"] = {t: d["addr"].get(t, mx) for t in set(rec["addr_norm"].split())}
+
+
 def _count_map(keys: pd.Series, lookup: pd.Series, ids) -> pd.Series:
     """For each key in `lookup`, its count in `keys` (0 for missing keys), indexed by `ids`."""
     counts = keys[keys != ""].value_counts()
@@ -155,6 +189,7 @@ def generate_candidates(
     latin_only_tokens: bool = False,
     key_channel: bool = False,
     reverse: bool = False,
+    empty_k: int = 0,
 ) -> pd.DataFrame:
     """All candidate pairs (both pools) with blocking scores and key-frequency
     columns. `s1_universe` = the whole S1 file of the split (default: s1_df,
@@ -176,14 +211,17 @@ def generate_candidates(
     s1_id_set = set(s1_ids)
     del uni_rep, s1_core, s1_addr
     parts = []
+    df_counts: dict = {}
     for label, other in (("S2", s2_df), ("S3", s3_df)):
         rep = blocking.add_blocking_representations(other, n_jobs, pool=pool)
+        _accumulate_df(rep, df_counts)
         if seg_costs is not None:
             rep["name_seg"] = blocking_idf.segment_names(rep, seg_costs)
             progress.log(f"[v2] segmented {int((rep['name_seg'] != '').sum())} glued {label} names")
         progress.log(f"[v2] IDF top-{k} vs {label} (max_df={max_df})...")
         c = blocking_idf.topk_candidates(s1_rep, rep, k=k, max_df=max_df, label=f"-{label}",
-                                         field_weights=field_weights, latin_only_tokens=latin_only_tokens)
+                                         field_weights=field_weights, latin_only_tokens=latin_only_tokens,
+                                         empty_k=empty_k)
         c["key_channel"] = np.float32(0)
         if s1_keys is not None:
             kp = _key_pairs(s1_rep, s1_keys, rep)
@@ -248,7 +286,11 @@ def generate_candidates(
         c["source"] = label
         parts.append(c)
         del rep, pool_nfreq, s1_nfreq, pool_afreq
+    _finalize_idf(df_counts)
+    del df_counts
     cands = pd.concat(parts, ignore_index=True)
+    if "empty_channel" in cands:  # exact-key / reverse rows have no flag
+        cands["empty_channel"] = cands["empty_channel"].fillna(0).astype(np.float32)
     progress.log(f"[v2] candidates: {len(cands)} pairs ({len(cands) / max(len(s1_df), 1):.2f}/entity)")
     return cands
 
@@ -271,6 +313,8 @@ def prune_candidates(cands: pd.DataFrame, rel_floor, min_rank: int, country_of: 
         keep |= cands["key_channel"].to_numpy() == 1  # exact-key pairs have no cosine score; always kept
     if "rev_top1" in cands:
         keep |= cands["rev_top1"].to_numpy() == 1  # the pool record's own best S1 entity; always kept
+    if "empty_channel" in cands:
+        keep |= cands["empty_channel"].to_numpy() == 1  # best empty-address pool records; always kept
     out = cands[keep].reset_index(drop=True)
     progress.log(f"[v2] pruned to {len(out)} pairs (floor {rel_floor}x top, min rank {min_rank})")
     return out
@@ -298,6 +342,8 @@ def featurize(
     )
     s1_lookup = s1_full.set_index("entity_id").to_dict(orient="index")
     other_lookup = other_full.set_index("entity_id").to_dict(orient="index")
+    _attach_idf(s1_lookup, "name_tokens_no_suffix")
+    _attach_idf(other_lookup, "name_tokens_no_suffix")
     cand_core = [tr.name_core(other_lookup[b]["name_norm"]) for b in cands["candidate_entity_id"]]
     cand_addr = [other_lookup[b]["addr_norm"] for b in cands["candidate_entity_id"]]
     del s1_full, other_full
@@ -344,6 +390,7 @@ def featurize(
     X["name_lev_rel"] = X["name_levenshtein_ratio"] - g["name_levenshtein_ratio"].transform("max")
     X["addr_tok_rel"] = X["addr_token_jaccard"] - g["addr_token_jaccard"].transform("max")
     X["key_channel"] = cands["key_channel"].to_numpy(np.float32) if "key_channel" in cands else np.float32(0)
+    X["empty_channel"] = cands["empty_channel"].to_numpy(np.float32) if "empty_channel" in cands else np.float32(0)
     if "rev_top1" in cands:
         X["rev_top1"] = cands["rev_top1"].to_numpy(np.float32)
         X["rev_other"] = cands["rev_other"].to_numpy(np.float32)

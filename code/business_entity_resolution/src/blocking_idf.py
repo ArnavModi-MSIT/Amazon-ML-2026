@@ -177,6 +177,7 @@ def topk_candidates(
     label: str = "",
     field_weights: tuple[float, ...] | None = None,
     latin_only_tokens: bool = False,
+    empty_k: int = 0,
 ) -> pd.DataFrame:
     """`s1_rep`/`pool_rep` need entity_id, country, name_norm, name_skeleton,
     addr_norm (e.g. from blocking.add_blocking_representations).
@@ -189,11 +190,14 @@ def topk_candidates(
     `field_weights=(w_name, w_addr[, c])`, or a {country: (...)} dict (other
     countries: joint cosine), scores w_name*cos(name tokens) +
     w_addr*cos(address tokens) instead of one joint cosine; `c` treats an
-    empty pool address as partial agreement (see `_field_normalize`)."""
+    empty pool address as partial agreement (see `_field_normalize`).
+
+    `empty_k` > 0 also returns each S1 record's top-`empty_k` among EMPTY-address pool records (same cosine, columns
+    restricted), flagged `empty_channel` = 1: with no address tokens they rank below same-address look-alikes."""
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sparse_dot_topn import sp_matmul_topn
 
-    out = []
+    out, out_e = [], []
     for country in sorted(set(s1_rep["country"]) & set(pool_rep["country"])):
         q = s1_rep[s1_rep["country"] == country]
         p = pool_rep[pool_rep["country"] == country]
@@ -210,14 +214,18 @@ def topk_candidates(
         ).tocsr()
         fw = field_weights.get(country) if isinstance(field_weights, dict) else field_weights
         if fw is None:
-            PT = _mask_and_normalize(P, keep).T.tocsr()
+            Pn = _mask_and_normalize(P, keep)
             Q = _mask_and_normalize(Q, keep)
         else:
             is_addr = np.char.startswith(vec.get_feature_names_out().astype(str), "a:")
             w_name, w_addr, *c = fw  # optional third value: empty-address neutral cosine
-            PT = _field_normalize(P, keep, is_addr, (w_name, w_addr), c[0] if c else None).T.tocsr()
+            Pn = _field_normalize(P, keep, is_addr, (w_name, w_addr), c[0] if c else None)
             Q = _field_normalize(Q, keep, is_addr, (1.0, 1.0))
         del P
+        PT = Pn.T.tocsr()
+        emp = np.flatnonzero(p["addr_norm"].str.strip().eq("").to_numpy()) if empty_k else np.array([], dtype=int)
+        PTe = Pn[emp].T.tocsr() if len(emp) else None
+        del Pn
         q_ids = q["entity_id"].to_numpy()
         p_ids = p["entity_id"].to_numpy()
         progress.log(f"  [idf{label}] {country}: {len(q)} S1 x {len(p)} pool, vocab kept {int(keep.sum())}")
@@ -230,7 +238,16 @@ def topk_candidates(
                 "block_score": S.data.astype(np.float32),
             })
             out.append(df)
-        del PT, Q
+            if PTe is not None:
+                Se = sp_matmul_topn(Q[start:start + MATMUL_BATCH], PTe, top_n=empty_k, threshold=0.0,
+                                    n_threads=-1).tocsr()
+                rows = np.repeat(np.arange(Se.shape[0]), np.diff(Se.indptr))
+                out_e.append(pd.DataFrame({
+                    "source1_entity_id": q_ids[start + rows],
+                    "candidate_entity_id": p_ids[emp[Se.indices]],
+                    "block_score": Se.data.astype(np.float32),
+                }))
+        del PT, Q, PTe
     if not out:
         return pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id", "block_score",
                                      "block_rank", "block_top_score"])
@@ -239,6 +256,19 @@ def topk_candidates(
         res.groupby("source1_entity_id")["block_score"].rank(method="first", ascending=False).astype(np.int16) - 1
     )
     res["block_top_score"] = res.groupby("source1_entity_id")["block_score"].transform("max").astype(np.float32)
+    if empty_k:
+        res["empty_channel"] = np.float32(0)
+        if out_e:
+            e = pd.concat(out_e, ignore_index=True)
+            known = set(zip(res["source1_entity_id"], res["candidate_entity_id"]))
+            new = np.fromiter((pr not in known for pr in zip(e["source1_entity_id"], e["candidate_entity_id"])),
+                              dtype=bool, count=len(e))
+            e = e[(e["block_score"].to_numpy() > 0) & new]
+            top = res.groupby("source1_entity_id")["block_top_score"].first()
+            e = e.assign(block_rank=np.int16(k), empty_channel=np.float32(1),
+                         block_top_score=e["source1_entity_id"].map(top).fillna(0).astype(np.float32))
+            progress.log(f"  [idf{label}] empty-address channel: +{len(e)} pairs")
+            res = pd.concat([res, e], ignore_index=True)
     return res
 
 

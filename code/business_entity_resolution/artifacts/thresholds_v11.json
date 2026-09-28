@@ -1,0 +1,33 @@
+{
+  "tau0": 0.0,
+  "tau": 0.8,
+  "tau_fallback": 0.8,
+  "k": 10,
+  "max_df": 50000,
+  "rel_floor": {
+    "default": 0.5,
+    "India": 0.55
+  },
+  "min_rank": 3,
+  "repr_version": "v8",
+  "field_weights": {
+    "India": [
+      0.7,
+      1.0,
+      0.5
+    ]
+  },
+  "segment": true,
+  "n_ensemble": 1,
+  "latin_only_tokens": true,
+  "translit": "translit_v11.json",
+  "key_channel": true,
+  "reverse": true,
+  "universe_frac": 0.81,
+  "lgb_params": {
+    "num_leaves": 127,
+    "max_depth": -1,
+    "min_child_samples": 100,
+    "colsample_bytree": 0.7
+  }
+}

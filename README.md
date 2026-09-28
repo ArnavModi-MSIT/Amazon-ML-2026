@@ -1,29 +1,61 @@
 # Amazon ML Challenge 2026 — Business Entity Resolution
 
-Match each Source 1 business to its duplicates in Sources 2 and 3 (US, India, France). Scored on per-entity
-macro F0.5, with smaller candidate sets ranked higher.
+An end-to-end entity-resolution system for matching each Source 1 business to duplicate records in Sources 2 and 3 across the United States, India, and France.
 
-**Best submission: #07 (v9), leaderboard score 0.971** (held-out validation 0.9803, 13.3 candidates/entity).
+## Result
 
-| Path | What |
+**Best leaderboard score: 0.976331 (submission #13).**
+
+The final system combines a LightGBM candidate classifier with a fine-tuned multilingual MiniLM cross-encoder. It achieves a test-like held-out macro F0.5 score of **0.9844** while producing an average of **13.29 candidates per Source 1 entity**.
+
+## How it works
+
+1. Normalize multilingual business names, addresses, phone numbers, and websites.
+2. Generate a small candidate set using IDF-weighted token similarity, exact keys, and a reverse best-match channel.
+3. Score 87 pairwise and candidate-context features with LightGBM.
+4. Re-score difficult candidates with a multilingual cross-encoder trained on challenge data.
+5. Blend both model probabilities, apply country-aware thresholds, and resolve matches globally with a one-to-one constraint.
+
+Important design choices include support for nine Indic scripts, a transliteration dictionary learned only from training pairs, glued-name segmentation, test-density-matched training, and full-pool validation instead of artificially easy sampled pools.
+
+## Repository structure
+
+| Path | Contents |
 |---|---|
-| [`APPROACH.md`](APPROACH.md) | Write-up: design, validation method, every version v1–v9 with measurements |
-| [`code/business_entity_resolution/`](code/business_entity_resolution/) | Exactly the code used for submission #07, with the trained model, settings and learned dictionary |
-| [`submissions/SCOREBOARD.md`](submissions/SCOREBOARD.md) | Every submission with local validation and real score |
-| [`submissions/submission_07_v9_reverse/`](submissions/submission_07_v9_reverse/) | Submission #07 outputs (gzipped) + how they were generated |
-| [`utils/validate_submission.py`](utils/validate_submission.py) | Official submission validator (called by the inference script) |
+| [`SOLUTION.md`](SOLUTION.md) | Detailed methodology, experiments, validation, and results |
+| [`APPROACH.md`](APPROACH.md) | Development history and measured model iterations |
+| [`code/business_entity_resolution/`](code/business_entity_resolution/) | Final inference/training pipeline, model artifacts, and neural scoring code |
+| [`submissions/SCOREBOARD.md`](submissions/SCOREBOARD.md) | Complete submission history with local and leaderboard scores |
+| [`submissions/submission_13_nn2/`](submissions/submission_13_nn2/) | Best submission outputs and generation notes |
+| [`utils/validate_submission.py`](utils/validate_submission.py) | Official-format submission validator |
 
-## Pipeline (v9) in one paragraph
+## Reproduce the final output
 
-Script-aware normalization (Latin-diacritic folding, record-id / honorific / look-alike-digit cleanup, country-aware
-address canonicalization) with a transliteration dictionary learned from the training pairs plus a 9-script Indic
-skeleton and phonetic codes; candidate generation by IDF-weighted token cosine (top-10 per source per entity, per
-country, field-weighted for India, glued website names segmented into S1 words), plus an exact-key channel and a
-reverse channel (each Source 2/3 record's single best Source 1 entity); relative-score pruning; 81 pairwise,
-blocking, within-entity, S1-population and reverse features; LightGBM trained on 150k entities against the full
-5M-record pools; one probability threshold (0.80) and global one-to-one conflict resolution. No external data.
+### Requirements
 
-## Reproduce
+- Python 3.10+
+- About 32 GB RAM for full inference
+- A CUDA GPU or Kaggle notebook for neural re-scoring
+- Competition data placed under `dataset/train/` and `dataset/test/`
 
-Place the competition data at `dataset/train/` and `dataset/test/`, then follow
-[`code/business_entity_resolution/README.md`](code/business_entity_resolution/README.md).
+Install the dependencies:
+
+```bash
+cd code/business_entity_resolution
+python -m venv .venv
+source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+Run LightGBM inference, then blend the included neural scores:
+
+```bash
+python -u -m src.run_inference_v2 --tag v11
+python -m src.blend_nn --tag v11 --nn artifacts/nn_test_scores.parquet
+```
+
+The expected best-submission checksum is documented in [`submissions/submission_13_nn2/HOW_GENERATED.md`](submissions/submission_13_nn2/HOW_GENERATED.md). For full retraining and GPU steps, see the [pipeline README](code/business_entity_resolution/README.md).
+
+## Data and licensing note
+
+The competition dataset is not redistributed. The repository contains the code, trained tabular model, learned challenge-data artifacts, neural prediction scores, and compressed submission outputs required to inspect and reproduce the final decision stage. Verify the competition rules and the pretrained model license before redistributing artifacts or using the system commercially.

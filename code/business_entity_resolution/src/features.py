@@ -24,6 +24,7 @@ Reconciled per the plan from four external reviews:
 from __future__ import annotations
 
 from functools import lru_cache
+import re
 from typing import Any
 
 import numpy as np
@@ -163,6 +164,39 @@ def build_name_features(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float
     return feats
 
 
+def _idf_overlap(wa: dict, wb: dict) -> tuple[float, float]:
+    """(IDF-weighted Jaccard, IDF of the rarest token present on only one side). -1s when a side is empty."""
+    if not wa or not wb:
+        return -1.0, -1.0
+    union = wa.keys() | wb.keys()
+    shared = wa.keys() & wb.keys()
+    w = {**wb, **wa}
+    tot = sum(w[t] for t in union)
+    only = [w[t] for t in union - shared]
+    return (sum(w[t] for t in shared) / tot if tot else 0.0), (max(only) if only else 0.0)
+
+
+_NUM_RE = re.compile(r"\d+")
+
+
+def build_idf_features(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float]:
+    """Pool-IDF-weighted token overlap per field: a shared rare word is near-proof, a rare word present on
+    only one side ("holl optimal first" vs "holl optimal fourth") is strong evidence against."""
+    n_wjac, n_only = _idf_overlap(a.get("name_idf", {}), b.get("name_idf", {}))
+    a_wjac, a_only = _idf_overlap(a.get("addr_idf", {}), b.get("addr_idf", {}))
+    ta, tb = a.get("name_tokens_no_suffix", ()), b.get("name_tokens_no_suffix", ())
+    acro_a, acro_b = "".join(t[0] for t in ta), "".join(t[0] for t in tb)
+    join_a, join_b = "".join(ta), "".join(tb)
+    acronym = float((len(acro_a) >= 2 and acro_a == join_b) or (len(acro_b) >= 2 and acro_b == join_a))
+    na, nb = set(_NUM_RE.findall(a.get("name_norm", ""))), set(_NUM_RE.findall(b.get("name_norm", "")))
+    return {
+        "name_tok_wjac": n_wjac, "name_max_only_idf": n_only,
+        "addr_tok_wjac": a_wjac, "addr_max_only_idf": a_only,
+        "name_acronym_match": acronym,
+        "name_num_conflict": (float(not (na & nb)) if na and nb else -1.0),
+    }
+
+
 def build_address_features(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float]:
     a_norm, b_norm = a["addr_norm"], b["addr_norm"]
     a_missing, b_missing = (not a_norm), (not b_norm)
@@ -231,6 +265,7 @@ def build_pair_features(a: dict[str, Any], b: dict[str, Any], target_source: int
     feats.update(build_name_features(a, b))
     feats.update(build_address_features(a, b))
     feats.update(build_cross_field_features(a, b))
+    feats.update(build_idf_features(a, b))
     feats["country_match"] = float(a["country"] == b["country"])
     feats["target_source"] = float(target_source)
     return feats

@@ -67,9 +67,21 @@ def main() -> None:
                                                 segment=th.get("segment", False),
                                                 latin_only_tokens=th.get("latin_only_tokens", False),
                                                 key_channel=th.get("key_channel", False),
+                                                empty_k=th.get("empty_k", 0),
                                                 reverse=th.get("reverse", False))
         cands = pipeline_v2.prune_candidates(cands, th.get("rel_floor"), th.get("min_rank", 3),
                                              country_of=pd.Series(s1["country"].to_numpy(), index=s1["entity_id"]))
+        if th.get("stage1_model"):  # supervised meta-blocking: last candidate-generation step
+            import lightgbm as lgb
+            from . import meta_blocking
+            st1 = lgb.Booster(model_file=str(config.ARTIFACTS_DIR / th["stage1_model"]))
+            X1 = meta_blocking.stage1_matrix(cands, pd.Series(s1["country"].to_numpy(), index=s1["entity_id"]),
+                                             (fw or {}).keys())
+            keep = st1.predict(X1) >= th["stage1_tau"]
+            del X1
+            cands = cands[keep].reset_index(drop=True)
+            progress.log(f"[stage1] meta-blocking kept {keep.mean():.1%}: {len(cands)} pairs "
+                         f"({len(cands) / len(s1):.2f}/entity)")
         cands = cands.sort_values("source1_entity_id", kind="stable").reset_index(drop=True)
         s1_ids = s1["entity_id"].tolist()
         for i in range(0, len(s1_ids), BATCH):

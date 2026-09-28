@@ -1,6 +1,6 @@
-# Amazon ML Challenge 2026 — Business Entity Resolution: Current Approach (v6)
+# Amazon ML Challenge 2026 — Business Entity Resolution: Approach (final model)
 
-_Status as of 26 Sep 2026, 09:15 IST. Submission deadline: 27 Sep 2026, 11:59 PM IST._
+_Final status as of 27 Sep 2026._
 
 **Version history (full-pool held-out validation → leaderboard):**
 
@@ -14,7 +14,11 @@ _Status as of 26 Sep 2026, 09:15 IST. Submission deadline: 27 Sep 2026, 11:59 PM
 | v6 | + review bug fixes, India pruning floor 0.55, 150k training entities | 0.9712 | 0.962 (#05) |
 | v7 | + native words dropped from blocking, 2 teammate features (3-seed ensemble tested: worse) | 0.9718 | not submitted |
 | v8 | + learned transliteration dictionary, name/address cleanup, exact-key channel, 3 features (ideas from public repos) | 0.9768 | 0.968 (#06) |
-| **v9** | + reverse top-1 channel (each pool record's best S1 among the whole S1 file) as candidates + 3 features | **0.9803** | **0.971** (#07) |
+| v9 | + reverse top-1 channel (each pool record's best S1 among the whole S1 file) as candidates + 3 features | 0.9803 | 0.971 (#07) |
+| v10 | + 6 IDF-overlap / acronym / name-number-conflict features, 127-leaf LightGBM | 0.9826 (test-like rows: 0.9807) | not submitted |
+| v11 | v10 trained at test-like ownerless-record density (`--universe-frac 0.81`) | **0.9820 on test-like rows** (v9 0.9786 on the same rows) | 0.972174 (#10) |
+| v12 | v11 + empty-address candidate channel (measured, not used: +9% candidates, −0.0003) | 0.9817 (test-like) | not submitted |
+| **final** | v11 blended with a multilingual MiniLM cross-encoder trained on all 1.32M pairs for two epochs | **0.9844 test-like** | **0.976331 (#13)** |
 
 Sections 3–4 describe v2 as originally reviewed; the v3–v6 changes are summarised in §3.7 and §3.8.
 
@@ -116,7 +120,10 @@ records ─► normalization (text_repr) ─► candidate generation: IDF-weight
 - Per S1 entity, three thresholds swept jointly against real macro F0.5 on validation:
   `tau0` (if the best candidate's prob < tau0 → predict empty; targets singletons), `tau` (include every candidate
   with prob ≥ tau), `tau_fallback` (if none ≥ tau but best ≥ tau_fallback → predict only the best).
-  Current: tau0 = 0.3, tau_fallback = 0.7, tau = 0.7.
+  This was the v2 rule (0.3 / 0.7 / 0.7). From v3 on it is a **single threshold** (tau0 = 0, tau_fallback = tau):
+  re-running the 3-threshold sweep on v9 validation scores picked 0.3/0.8/0.8 and scored exactly the same (0.9803),
+  so the singleton gate adds nothing. v9–v11 use tau = 0.80 (leaderboard probes on v9: 0.75 → 0.970469,
+  0.80 → 0.970791, 0.88 → 0.970398).
 - **One-to-one constraint** (verified on train: no S2/S3 record is ever matched to more than one S1 entity): greedy
   global conflict resolution keeps only the highest-probability S1 claimant per candidate, applied once after all
   inference batches.
@@ -243,8 +250,8 @@ model gets **0.486** — i.e. full-pool validation tracks the leaderboard; sampl
 
 (K=5 numbers = the K=10-trained model evaluated on only the candidates with block_rank < 5.)
 
-Leaderboard so far: 0.433 → 0.518 → 0.519 (v1 variants) → **0.927** (v3). **0.962** (v6, #05; val 0.9712). Later versions: v3 0.9399 and
-v4 **0.9563** on this validation (India 0.947 / US 0.962, 11.99 candidates/entity). The public board's top is ≈ 0.987.
+Leaderboard progression: 0.433 → 0.518 → 0.519 → 0.927 → 0.962 → 0.968 → 0.970791 → 0.972174 → 0.975 → **0.976331**.
+The final result is submission #13; see `SOLUTION.md` for the complete final-model analysis.
 
 ---
 
